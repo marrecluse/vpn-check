@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>VPN Check</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex, nofollow">
+<meta name="theme-color" content="#0f766e">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-180.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="VPN Check">
+<style>
+  :root { --bg:#f8fafc; --ink:#0f172a; --muted:#475569; --card:#fff; --line:#cbd5e1;
+          --good:#166534; --goodbg:#dcfce7; --warn:#92400e; --warnbg:#fef3c7; --bad:#991b1b; --badbg:#fee2e2; --accent:#0f766e; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#0b1220; --ink:#f1f5f9; --muted:#94a3b8; --card:#131c2e; --line:#26334d;
+          --good:#86efac; --goodbg:#14532d; --warn:#fcd34d; --warnbg:#713f12; --bad:#fca5a5; --badbg:#7f1d1d; } }
+  * { box-sizing: border-box; }
+  body { margin:0; font:19px/1.55 -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+         background:var(--bg); color:var(--ink); padding: env(safe-area-inset-top) 16px 40px; }
+  main { max-width: 640px; margin: 0 auto; }
+  h1 { font-size: 22px; margin: 18px 0 2px; }
+  .sub { color: var(--muted); font-size: 15px; margin: 0 0 12px; min-height: 1.4em; }
+  .status { border-radius: 16px; padding: 20px 18px; margin: 12px 0; border: 2px solid; }
+  .status.good { background:var(--goodbg); color:var(--good); border-color:var(--good); }
+  .status.warn { background:var(--warnbg); color:var(--warn); border-color:var(--warn); }
+  .status.bad  { background:var(--badbg);  color:var(--bad);  border-color:var(--bad); }
+  .status.wait { background:var(--card); color:var(--muted); border-color:var(--line); }
+  .status h2 { margin:0 0 8px; font-size: 27px; line-height:1.25; }
+  .status p  { margin:8px 0; }
+  ol.steps { padding-inline-start: 26px; margin: 12px 0 0; }
+  ol.steps li { margin: 10px 0; }
+  .row { display:flex; gap:10px; flex-wrap:wrap; margin: 14px 0; }
+  button { font:inherit; font-weight:600; padding: 15px 18px; border-radius: 12px; border: 2px solid var(--accent);
+           background: var(--accent); color:#fff; flex: 1 1 200px; cursor:pointer; }
+  button.ghost { background: transparent; color: var(--accent); }
+  button:focus-visible, summary:focus-visible { outline: 3px solid #f59e0b; outline-offset: 2px; }
+  details { background: var(--card); border:1px solid var(--line); border-radius: 12px; padding: 10px 14px; margin: 10px 0; }
+  summary { cursor:pointer; font-weight:600; }
+  table { width:100%; border-collapse: collapse; margin-top: 8px; font-size: 16px; }
+  td { padding: 7px 4px; border-top: 1px solid var(--line); vertical-align: top; }
+  .dot { display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:8px; }
+  .ok .dot{background:#16a34a} .warn .dot{background:#d97706} .fail .dot{background:#dc2626}
+  .small { color: var(--muted); font-size: 14px; }
+  .demo { background:#fde68a; color:#78350f; padding:6px 10px; border-radius:8px; font-size:14px; margin-top:10px; }
+  [hidden] { display:none !important; }
+</style>
+</head>
+<body>
+<main>
+  <h1>VPN Check</h1>
+  <p class="sub" id="who"></p>
+  <div id="demo" class="demo" hidden></div>
+
+  <section id="status" class="status wait" aria-live="polite"><h2>Checking…</h2></section>
+
+  <div class="row">
+    <button type="button" id="again">Check again</button>
+    <button type="button" id="copy" class="ghost">Copy report for Abdul</button>
+  </div>
+  <p class="small" id="checked"></p>
+
+  <details id="details" hidden><summary>Details</summary><div id="detailbody"></div></details>
+
+  <details>
+    <summary>Make this open even when the internet is blocked</summary>
+    <p>Open this page once with the internet working, then add it to your home screen. It will then open even when the VPN has blocked your internet.</p>
+    <p><b>iPhone (Safari):</b> Share button, then Add to Home Screen.<br><b>Android (Chrome):</b> the ⋮ menu, then Install app or Add to Home screen.</p>
+  </details>
+</main>
+
+<script src="logic.js"></script>
+<script>
+(function () {
+  'use strict';
+  var API = 'https://vpncheck.marrecluse.net/s/';
+
+  var T = {
+    ok:   { lvl: 'good', t: 'The VPN is working', d: 'Your device is connected to the server. If one website does not open, the problem is probably that website.', s: [] },
+    idle: { lvl: 'good', t: 'Probably fine', d: 'The server is working. Your device has not sent anything for a few minutes.', s: ['Open any website.', 'Wait 20 seconds.', 'Press Check again.'] },
+    device_off: { lvl: 'warn', t: 'Your device is not connected to the VPN', d: 'The server is working, but your device has not talked to it for a while. The VPN is probably switched off on your device.', s: ['Open the WireGuard app.', 'Switch your tunnel ON.', 'Press Check again.'] },
+    device_never: { lvl: 'warn', t: 'This device has never connected', d: 'The server has never heard from this device.', s: ['Ask Abdul to check the setup of this device.'] },
+    no_connection: { lvl: 'bad', t: 'No internet reaches this device', d: 'If your VPN is switched ON, the internet may have stopped because the VPN server is not answering.',
+      s: ['Switch the VPN OFF in the WireGuard app.', 'Press Check again.', 'If the internet now works, the VPN server is the problem: keep the VPN off and send the report to Abdul.', 'If it still does not work, check your Wi-Fi or mobile data.'] },
+    server_unreachable: { lvl: 'bad', t: 'The VPN server is not answering', d: 'Your internet works, but the server cannot be reached. It may be switched off or restarting. You cannot fix this yourself.',
+      s: ['Keep the VPN OFF for now.', 'Press “Copy report for Abdul” and send it to him.', 'Try again in a few minutes.'] },
+    vpn_service_down: { lvl: 'bad', t: 'The VPN program on the server has stopped', d: 'The server is on, but the VPN service is not running. The VPN will not work until Abdul restarts it.', s: ['Keep the VPN OFF for now.', 'Send the report to Abdul.'] },
+    vpn_no_internet: { lvl: 'bad', t: 'The VPN connects but cannot reach the internet', d: 'The server has a routing problem, so connected devices get no internet.', s: ['Keep the VPN OFF for now.', 'Send the report to Abdul.'] },
+    server_full: { lvl: 'bad', t: 'The server is out of disk space', d: 'The VPN may stop working until Abdul frees up space.', s: ['Send the report to Abdul.'] },
+    monitor_stale: { lvl: 'warn', t: 'The server answers, but its health monitor is not updating', d: 'The VPN may still work. Tell Abdul when convenient.', s: [] },
+    no_link: { lvl: 'warn', t: 'This page needs your private link', d: 'Open the link Abdul sent you. It has your device’s secret code in it.', s: [] }
+  };
+  var EXTRA = { server_strain: 'The server is under some strain, so the VPN may be slow.' };
+
+  var $ = function (id) { return document.getElementById(id); };
+  var el = function (tag, cls, text) { var e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; };
+  var store = { get: function (k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
+                set: function (k, v) { try { localStorage.setItem(k, v); } catch (e) {} } };
+  var params = new URLSearchParams(location.search);
+  var token = (params.get('k') || '').toLowerCase();
+  if (!/^[0-9a-f]{32}$/.test(token)) token = store.get('vpncheck.k') || '';
+  if (/^[0-9a-f]{32}$/.test(token)) store.set('vpncheck.k', token); else token = '';
+  var demo = params.get('demo');
+  var last = null;
+
+  function render(result, net, srv) {
+    var tpl = T[result.code], box = $('status');
+    box.className = 'status ' + tpl.lvl;
+    box.textContent = '';
+    box.appendChild(el('h2', '', tpl.t));
+    box.appendChild(el('p', '', tpl.d));
+    result.extra.forEach(function (x) { box.appendChild(el('p', '', EXTRA[x])); });
+    if (tpl.s.length) { var ol = el('ol', 'steps'); tpl.s.forEach(function (s) { ol.appendChild(el('li', '', s)); }); box.appendChild(ol); }
+
+    var d = srv.data;
+    $('who').textContent = d && d.device ? 'Device: ' + d.device.name : '';
+    var body = $('detailbody'); body.textContent = '';
+    if (srv.reachable && d && d.server) {
+      var tb = el('table');
+      var r0 = el('tr'); r0.appendChild(el('td', '', 'Your device')); r0.appendChild(el('td', '', d.device.status + ' · last contact ' + VpnLogic.ageText(d.device.handshake_age_s))); tb.appendChild(r0);
+      d.server.checks.forEach(function (c) {
+        var r = el('tr', c.level), a = el('td');
+        a.appendChild(el('span', 'dot')); a.appendChild(document.createTextNode(c.title));
+        r.appendChild(a); r.appendChild(el('td', '', c.detail)); tb.appendChild(r);
+      });
+      body.appendChild(tb);
+      $('details').hidden = false;
+    } else { $('details').hidden = true; }
+    $('checked').textContent = 'Last checked ' + new Date().toLocaleTimeString() + ' · checks again every 20 seconds';
+    document.title = (tpl.lvl === 'good' ? '✔ ' : tpl.lvl === 'warn' ? '! ' : '✖ ') + 'VPN Check';
+    last = { result: result, net: net, srv: srv };
+  }
+
+  function withTimeout(url, opts, ms) {
+    var c = new AbortController(), t = setTimeout(function () { c.abort(); }, ms);
+    opts.signal = c.signal;
+    return fetch(url, opts).finally(function () { clearTimeout(t); });
+  }
+  function probeInternet() {
+    var targets = ['https://www.gstatic.com/generate_204', 'https://www.cloudflare.com/cdn-cgi/trace'];
+    return Promise.all(targets.map(function (u) {
+      return withTimeout(u + '?t=' + Date.now(), { mode: 'no-cors', cache: 'no-store' }, 6000).then(function () { return true; }, function () { return false; });
+    })).then(function (r) { return { internet: r.some(Boolean) }; });
+  }
+  function probeServer() {
+    return withTimeout(API + token + '.json?t=' + Date.now(), { cache: 'no-store' }, 8000).then(function (res) {
+      if (!res.ok) return { reachable: false, data: null };
+      var st = parseFloat(res.headers.get('X-Server-Time'));
+      return res.json().then(function (data) { return { reachable: true, data: data, serverNow: isFinite(st) ? Math.floor(st) : null }; });
+    }).catch(function () { return { reachable: false, data: null }; });
+  }
+
+  var DEMOS = (function () {
+    var now = Math.floor(Date.now() / 1000);
+    var checks = function () { return [
+      { id: 'wg_service', level: 'ok', title: 'VPN service', detail: 'running' }, { id: 'wg_interface', level: 'ok', title: 'VPN network interface', detail: 'up' },
+      { id: 'wg_port', level: 'ok', title: 'VPN port (51820/udp)', detail: 'listening' }, { id: 'internet_via_vpn', level: 'ok', title: 'Internet through the VPN', detail: 'forwarding and NAT are in place' },
+      { id: 'disk', level: 'ok', title: 'Server disk', detail: '52% used' }]; };
+    var pay = function (status, age, mod) { var p = { generated_epoch: now - 4, server: { level: 'ok', checks: checks(), boot_age_s: 86400 }, device: { name: 'father (demo)', status: status, handshake_age_s: age } }; if (mod) mod(p); return p; };
+    var up = function (p) { return { reachable: true, data: p, serverNow: now }; };
+    var down = { reachable: false, data: null };
+    return {
+      ok: [{ internet: true }, up(pay('connected', 30))], idle: [{ internet: true }, up(pay('idle', 400))],
+      device_off: [{ internet: true }, up(pay('stale', 7200))], device_never: [{ internet: true }, up(pay('never', null))],
+      no_connection: [{ internet: false }, down], server_unreachable: [{ internet: true }, down],
+      vpn_service_down: [{ internet: true }, up(pay('stale', 900, function (p) { p.server.level = 'fail'; p.server.checks[0] = { id: 'wg_service', level: 'fail', title: 'VPN service', detail: 'STOPPED: the VPN program on the server is not running' }; }))],
+      vpn_no_internet: [{ internet: true }, up(pay('connected', 20, function (p) { p.server.level = 'fail'; p.server.checks[3] = { id: 'internet_via_vpn', level: 'fail', title: 'Internet through the VPN', detail: 'forwarding/NAT missing' }; }))],
+      server_full: [{ internet: true }, up(pay('connected', 20, function (p) { p.server.level = 'fail'; p.server.checks[4] = { id: 'disk', level: 'fail', title: 'Server disk', detail: '99% used' }; }))],
+      monitor_stale: [{ internet: true }, up(pay('connected', 20, function (p) { p.generated_epoch = now - 600; }))],
+      strain: [{ internet: true }, up(pay('connected', 20, function (p) { p.server.level = 'warn'; p.server.checks[4] = { id: 'disk', level: 'warn', title: 'Server disk', detail: '92% used' }; }))]
+    };
+  })();
+
+  function run() {
+    if (demo && DEMOS[demo]) {
+      $('demo').hidden = false; $('demo').textContent = 'DEMO MODE: showing a simulated situation (“' + demo + '”). Nothing here is real.';
+      var net = DEMOS[demo][0], srv = DEMOS[demo][1];
+      return Promise.resolve(render(VpnLogic.decide(net, srv), net, srv));
+    }
+    if (!token) return Promise.resolve(render({ code: 'no_link', level: 'warn', extra: [] }, { internet: true }, { reachable: false, data: null }));
+    return Promise.all([probeInternet(), probeServer()]).then(function (r) { render(VpnLogic.decide(r[0], r[1]), r[0], r[1]); });
+  }
+
+  $('again').addEventListener('click', function () { $('status').className = 'status wait'; $('checked').textContent = 'Checking…'; run(); });
+  $('copy').addEventListener('click', function () {
+    if (!last) return;
+    var text = VpnLogic.buildReport(last.result, last.net, last.srv, new Date());
+    var done = function () { $('checked').textContent = 'Report copied. Paste it into WhatsApp and send it to Abdul.'; };
+    if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(done, function () { window.prompt('Copy this report:', text); });
+    else window.prompt('Copy this report:', text);
+  });
+
+  if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) {
+    try { navigator.serviceWorker.register('sw.js'); } catch (e) {}
+  }
+  run();
+  setInterval(run, 20000);
+})();
+</script>
+</body>
+</html>

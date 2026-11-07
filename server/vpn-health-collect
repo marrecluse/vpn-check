@@ -1,0 +1,138 @@
+#!/usr/bin/env python3
+"""Collect WireGuard + server health and write one small JSON file per device.
+
+Runs as root every ~15 s (systemd timer). Output goes to /var/lib/vpn-health/public/<token>.json, which nginx serves
+read-only. The token is a random 128-bit value known only to the device owner (it is the secret in their link).
+The files contain NO keys, IP addresses or endpoints: only a device label, handshake age, byte counts and
+plain health checks.
+"""
+import json, os, re, secrets, shutil, subprocess, time
+from datetime import datetime, timezone
+
+IFACE = "wg0"
+CONF = f"/etc/wireguard/{IFACE}.conf"
+CFG_DIR = "/etc/vpn-health"
+DEVICES = f"{CFG_DIR}/devices.json"          # {"father": "<token>", ...}  (root-only)
+OUT = "/var/lib/vpn-health/public"
+CONNECTED_S, IDLE_S = 180, 900
+
+
+def sh(cmd):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=8).stdout.strip()
+    except Exception:
+        return ""
+
+
+def peers_from_conf():
+    """Map tunnel IP -> label using the '# name' comment above each peer's AllowedIPs."""
+    out, label = {}, None
+    for line in open(CONF):
+        s = line.strip()
+        if s.startswith("[Peer]"):
+            label = None
+        elif s.startswith("#") and label is None:
+            label = s.lstrip("# ").strip()
+        elif s.startswith("AllowedIPs") and label:
+            ip = s.split("=", 1)[1].split(",")[0].strip().split("/")[0]
+            out[ip] = label
+    return out
+
+
+def wg_dump():
+    rows = {}
+    for line in sh(["wg", "show", IFACE, "dump"]).splitlines()[1:]:
+        f = line.split("\t")
+        if len(f) >= 7:
+            ip = f[3].split(",")[0].split("/")[0]
+            rows[ip] = {"handshake": int(f[4]), "rx": int(f[5]), "tx": int(f[6])}
+    return rows
+
+
+def check(id_, level, title, detail):
+    return {"id": id_, "level": level, "title": title, "detail": detail}
+
+
+def server_checks():
+    c = []
+    active = sh(["systemctl", "is-active", f"wg-quick@{IFACE}"]) == "active"
+    c.append(check("wg_service", "ok" if active else "fail", "VPN service",
+                   "running" if active else "STOPPED: the VPN program on the server is not running"))
+    link = sh(["ip", "-br", "link", "show", IFACE])
+    up = bool(link) and ("UP" in link or "UNKNOWN" in link)
+    c.append(check("wg_interface", "ok" if up else "fail", "VPN network interface", "up" if up else "down or missing"))
+    listening = bool(sh(["ss", "-ulnH", "sport = :51820"]))
+    c.append(check("wg_port", "ok" if listening else "fail", "VPN port (51820/udp)",
+                   "listening" if listening else "NOT listening: devices cannot connect"))
+    fwd = open("/proc/sys/net/ipv4/ip_forward").read().strip() == "1"
+    nat = "MASQUERADE" in sh(["iptables", "-t", "nat", "-S", "POSTROUTING"])
+    c.append(check("internet_via_vpn", "ok" if (fwd and nat) else "fail", "Internet through the VPN",
+                   "forwarding and NAT are in place" if (fwd and nat) else "forwarding/NAT missing: connected devices would have no internet"))
+    du = shutil.disk_usage("/")
+    pct = 100 * du.used / du.total
+    c.append(check("disk", "fail" if pct >= 97 else "warn" if pct >= 90 else "ok", "Server disk", f"{pct:.0f}% used"))
+    mem = {l.split(":")[0]: int(l.split()[1]) for l in open("/proc/meminfo") if ":" in l}
+    avail = 100 * mem.get("MemAvailable", 0) / max(mem.get("MemTotal", 1), 1)
+    c.append(check("memory", "warn" if avail < 5 else "ok", "Server memory", f"{avail:.0f}% available"))
+    load1 = os.getloadavg()[0]
+    cores = os.cpu_count() or 1
+    c.append(check("load", "warn" if load1 > cores * 3 else "ok", "Server load", f"{load1:.2f} on {cores} cores"))
+    return c
+
+
+def main():
+    os.makedirs(CFG_DIR, mode=0o700, exist_ok=True)
+    os.makedirs(OUT, exist_ok=True)
+    os.chmod("/var/lib/vpn-health", 0o755)
+    os.chmod(OUT, 0o755)
+    labels = peers_from_conf()
+    names = sorted(set(labels.values()))
+    try:
+        tokens = json.load(open(DEVICES))
+    except Exception:
+        tokens = {}
+    changed = False
+    for n in names:
+        if n not in tokens:
+            tokens[n] = secrets.token_hex(16)
+            changed = True
+    if changed:
+        with open(DEVICES, "w") as fh:
+            json.dump(tokens, fh, indent=1)
+        os.chmod(DEVICES, 0o600)
+
+    now = int(time.time())
+    checks = server_checks()
+    worst = "fail" if any(x["level"] == "fail" for x in checks) else "warn" if any(x["level"] == "warn" for x in checks) else "ok"
+    boot_age = int(float(open("/proc/uptime").read().split()[0]))
+    dump = wg_dump()
+    ip_of = {v: k for k, v in labels.items()}
+
+    wanted = set()
+    for name, token in tokens.items():
+        if name not in names:
+            continue
+        d = dump.get(ip_of.get(name, ""), {"handshake": 0, "rx": 0, "tx": 0})
+        age = (now - d["handshake"]) if d["handshake"] else None
+        status = ("never" if age is None else "connected" if age <= CONNECTED_S else "idle" if age <= IDLE_S else "stale")
+        payload = {
+            "v": 1,
+            "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "generated_epoch": now,
+            "server": {"level": worst, "checks": checks, "boot_age_s": boot_age},
+            "device": {"name": name, "status": status, "handshake_age_s": age, "rx_bytes": d["rx"], "tx_bytes": d["tx"]},
+        }
+        path = os.path.join(OUT, f"{token}.json")
+        tmp = path + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(payload, fh, separators=(",", ":"))
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+        wanted.add(f"{token}.json")
+    for f in os.listdir(OUT):                      # remove files for retired devices
+        if f.endswith(".json") and f not in wanted:
+            os.remove(os.path.join(OUT, f))
+
+
+if __name__ == "__main__":
+    main()
